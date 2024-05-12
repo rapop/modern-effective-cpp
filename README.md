@@ -677,3 +677,611 @@ processedWidgets.emplace_back(shared_from_this());
 
 ## Item 20: Use std::weak_ptr for std::shared_ptr-like pointers that can dangle.
 
+`std::weak_ptr` is like a `shared_prt` that doesn't affect reference count.
+
+It can dangle (point to something that has been destroyed)
+
+You can check if it has expired with `expired()`
+
+`std::weak_ptrs` lack dereferencing operations
+
+between the call to expired and the dereferencing action,
+another thread might reassign or destroy the last std::shared_ptr pointing to the
+object, thus causing that object to be destroyed. In that case, your dereference would
+yield undefined behavior
+
+you need is an atomic operation that checks to see if the `std::weak_ptr` has
+expired and, if not, gives you access to the object it points to.
+
+This is done by creating a `std::shared_ptr` from the `std::weak_ptr`.
+with `lock()`
+
+or with ctor
+
+```
+std::shared_ptr<Widget> spw3(wpw);
+// if wpw's expired,
+// throw std::bad_weak_ptr
+```
+
+weak_ptrs can be useful for caching, Observer design pattern or circular dependencies (A points to B and B points to A).
+
+From an efficiency perspective, the `std::weak_ptr` story is essentially the same as
+that for `std::shared_ptr`
+
+## Item 21: Prefer std::make_unique and std::make_shared to direct use of new.
+
+```
+processWidget(std::shared_ptr<Widget>(new Widget),
+computePriority());
+// potential
+// resource
+// leak!
+```
+
+Because functions arguments must be evaluated before the function runs, but the compiler choose in which order the arguments are genereate when it produces the source code.
+
+disadvantage: none of the make functions permit the specification of custom deleters
+
+Also, we cannot brace initialize with `make`, we need to use `new` if we want to. Or this trick.
+
+```
+// create std::initializer_list
+auto initList = { 10, 20 };
+// create std::vector using std::initializer_list ctor
+auto spv = std::make_shared<std::vector<int>>(initList);
+```
+
+using make functions to create objects of types with class-specific versions of operator new and operator delete is typically a poor idea.
+
+With a direct use of new, the memory for the ReallyBigType object can be released
+as soon as the last std::shared_ptr to it is destroyed.
+
+This is not the case with `make` since the count for weak_ptr is in the control block is in the same control block as the object. It will wait till the last weak_ptr is destroyed even if it points to null.
+
+With `new`, only the memory for the control block remains allocated.
+
+## Item 22: When using the Pimpl Idiom, define special member functions in the implementation file.
+
+Pimpl (“pointer to implementation”) Idiom - for better build times
+
+version with unique ptr:
+
+```
+class Widget {
+public:
+Widget();
+…
+// in "widget.h"
+private:
+struct Impl;
+std::unique_ptr<Impl> pImpl;
+};
+
+
+#include "widget.h"
+#include "gadget.h"
+#include <string>
+#include <vector>// in "widget.cpp"
+struct Widget::Impl {
+std::string name;
+std::vector<double> data;
+Gadget g1, g2, g3;
+};// as before
+Widget::Widget()
+: pImpl(std::make_unique<Impl>())
+{}
+
+```
+
+Because Widget no longer mentions the types std::string, std::vector, and
+Gadget, Widget clients no longer need to #include the headers for these types. That
+speeds compilation, and it also means that if something in these headers changes,
+Widget clients are unaffected.
+
+# **Chapter 5:** Rvalue References, Move Semantics, and Perfect Forwarding
+
+perfect forwarding = write function templates that take arguments and forwards them to other function such that they receive th exact same arguments
+
+a parameter is always an lvalue
+`void f(Widget&& w);`
+
+A useful heuristic to determine whether an expression is an lvalue is to ask if you can
+take its address. If you can, it typically is.
+
+## Item 23: Understand std::move and std::forward.
+
+std::move unconditionally casts its argument to an rvalue, while
+std::forward performs this cast only if a particular condition is fulfilled.
+
+don’t declare objects const if you want to be able to move from them because Move requests on const objects are silently transformed into copy operations.
+
+std::forward is a conditional cast: it casts to an rvalue only if its argument was initialized with an
+rvalue.
+
+param is always a l-value since its a function param.
+
+```
+void process(const Widget& lvalArg);
+void process(Widget&& rvalArg);// process lvalues
+template<typename T>
+void logAndProcess(T&& param)
+{
+    auto now =
+    std::chrono::system_clock::now();// template that passes
+    makeLogEntry("Calling 'process'", now);
+    process(std::forward<T>(param));
+}
+```
+
+```
+Widget w;
+logAndProcess(w); // call with lvalue
+logAndProcess(std::move(w)); // call with rvalue
+```
+
+Neither std::move nor std::forward do anything at runtime.
+
+## Item 24: Distinguish universal references from rvalue references.
+
+“T&&” has two different meanings
+
+- r-value reference, binds to r-values, exists to identify objects that may be moved from.
+- either rvalue reference or lvalue reference, look like rvalue references in the source code (i.e., “T&&”), but they can bind to anything (we call them universal references)
+
+** universal references should almost always have std::forward applied to them, and as
+this book goes to press, some members of the C++ community have started referring to universal references
+as forwarding references
+
+Universal references arise in two contexts. The most common is function template
+parameters
+
+the second is auto declaration
+
+`auto&& var2 = var1;`
+
+What these contexts have in common is the presence of type deduction.
+
+**if you see “T&&” without type deduction, you’re looking at an rvalue reference**
+
+Because universal references are references, they must be initialized. The initializer
+for a universal reference determines whether it represents an rvalue reference or an
+lvalue reference. If the initializer is an rvalue, the universal reference corresponds to
+an rvalue reference. If the initializer is an lvalue, the universal reference corresponds
+to an lvalue reference.
+
+```
+template<typename T>
+void f(T&& param); // param is a universal reference
+Widget w;
+f(w); // lvalue passed to f; param's type is
+        // Widget& (i.e., an lvalue reference)
+
+
+f(std::move(w)); // rvalue passed to f; param's type is
+            // Widget&& (i.e., an rvalue reference)
+```
+
+presence of a const qualifier is enough to disqualify a reference from
+being universal
+
+```
+template<typename T>
+void f(const T&& param);
+// param is an rvalue reference
+```
+
+this entire Item—the foundation of universal references—is a lie…
+er, an “abstraction.” The underlying truth is known as reference collapsing
+
+## Item 25: Use std::move on rvalue references, std::forward on universal references.
+
+rvalue references should be unconditionally cast to rvalues (via std::move)
+when forwarding them to other functions, because they’re always bound to rvalues
+
+universal references should be conditionally cast to rvalues (via std::forward)
+when forwarding them, because they’re only sometimes bound to rvalues
+
+when used multiple times inside a function, you’ll want to apply std::move (for rvalue
+references) or std::forward (for universal references) to only the final use of the
+reference.
+
+If you’re in a function that **returns by value**, and you’re returning an object bound to
+an rvalue reference or a universal reference, you’ll want to apply std::move or
+std::forward when you return the reference.
+
+
+```
+Matrix
+operator+(Matrix&& lhs, const Matrix& rhs)
+{
+    lhs += rhs;
+    return std::move(lhs);
+}
+```
+
+lhs will be moved into the function’s return value location
+
+if not, the fact that lhs is an lvalue would force compilers to instead copy it into the return
+value location.
+
+works only if `Matrix` type supports move construction
+
+Never apply std::move or std::forward to local objects if they would other‐
+wise be eligible for the return value optimization.
+
+## Item 26: Avoid overloading on universal references.
+
+Avoid ineficiencies here:
+
+```
+std::multiset<std::string> names;
+void logAndAdd(const std::string& name)
+{
+auto now = std::chrono::system_clock::now();
+log(now, "logAndAdd");
+names.emplace(name);
+}
+```
+
+with:
+
+```
+template<typename T>
+void logAndAdd(T&& name)
+{
+auto now = std::chrono::system_clock::now();
+log(now, "logAndAdd");
+names.emplace(std::forward<T>(name));
+}
+```
+
+Functions taking universal references are the greediest functions in C++.
+
+```
+class Person {
+public:
+template<typename T>
+explicit Person(T&& n)
+: name(std::forward<T>(n)) {}
+
+explicit Person(int idx)
+: name(nameFromIdx(idx)) {}
+…
+
+private:
+std::string name;
+};
+```
+
+passing an integral type other than int (e.g.,
+std::size_t, short, long, etc.) will call the universal reference constructor over‐
+load instead of the int overload
+
+Perfect-forwarding constructors are especially problematic, because they’re
+typically better matches than copy constructors for non-const lvalues, and
+they can hijack derived class calls to base class copy and move constructors.
+
+## Item 27: Familiarize yourself with alternatives to overloading on universal references.
+
+Simply use different names for the would-be overloads.
+
+revert to C++98 and replace pass-by-universal-reference with
+pass-by-lvalue-reference-to-const, (const T&) but design is less efficient
+
+pass by value
+
+use tag dispatch:
+
+ex:
+
+```
+template<typename T>
+void logAndAdd(T&& name)
+{
+    logAndAddImpl(
+    std::forward<T>(name),
+    std::is_integral<typename std::remove_reference<T>::type>()
+    );
+}
+
+template<typename T>
+void logAndAddImpl(T&& name, std::false_type)
+{
+auto now = std::chrono::system_clock::now();
+log(now, "logAndAdd");
+names.emplace(std::forward<T>(name));
+}
+```
+
+`std::enable_if` gives you a way to force compilers to behave as if a particular tem‐
+plate didn’t exist.
+
+`std::decay<T>::type` is the same as T, except that references and cv-qualifiers (i.e.,
+const or volatile qualifiers) are removed.
+
+```
+class Person {
+public:
+template<
+typename T,
+typename = typename std::enable_if<!std::is_same<Person, typename std::decay<T>::type>::value>::type>
+explicit Person(T&& n);
+…
+};
+```
+
+`std::is_base_of<T1, T2>::value` is true if T2 is derived from T1
+
+```
+static_assert(
+std::is_constructible<std::string, T>::value,
+"Parameter n can't be used to construct a std::string"
+);
+```
+
+Universal reference parameters often have efficiency advantages, but they typ‐
+ically have usability disadvantages.
+
+ex: produce long error messages.
+
+## Item 28: Understand reference collapsing.
+
+If a reference to a reference arises in a context where this is per‐
+mitted (e.g., during template instantiation), the references collapse to a single refer‐
+ence according to this rule:
+
+If either reference is an lvalue reference, the result is an lvalue reference.
+Otherwise (i.e., if both are rvalue references) the result is an rvalue refer‐
+ence.
+
+calling func which takes an universal reference will collapse from this to this
+
+`void func(Widget& && param);`
+
+`void func(Widget& param);`
+
+Reference collapsing can also happen with `auto`, `typedef` and `decltype`
+
+A universal reference isn’t a new kind of reference, it’s actually an rvalue ref‐
+erence in a context where two conditions are satisfied:
+    • Type deduction distinguishes lvalues from rvalues. Lvalues of type T are
+    deduced to have type T&, while rvalues of type T yield T as their deduced type.
+    • Reference collapsing occurs.
+
+## Item 29: Assume that move operations are not present, not cheap, and not used.
+
+- pointer reassignment is what makes move faster than copy.
+- this is possible for types that are dynamically stored like `std::vector` which has a pointer to its data on the heap.
+
+Often, you dont know if the move operator is really gonna be invoked and thus the copy operator might be.
+You need to beconservative with your copy operations also when you don't konw, for example in templates.
+
+## Item 30: Familiarize yourself with perfect forwarding failure cases.
+
+Perfect forwarding means we don’t just forward objects, we also forward their salient
+characteristics: their types, whether they’re lvalues or rvalues, and whether they’re
+const or volatile.
+
+only universal reference parameters encode information about the
+lvalueness and rvalueness of the arguments that are passed to them
+
+```
+template<typename T>
+void fwd(T&& param)
+{
+f(std::forward<T>(param));
+}
+```
+
+perfect-forwarding happens is calling f or fwd with the same arguments does the same thing.
+
+Several kind or arguments makes this fail.
+
+**Braced initializers** are one example.
+In a direct call to f, the type is found by comparison by the compiler. But, for fwd the compiler try to deduce it instead of comparing whats passed to fwd and f.
+
+Perfect-forwarding can fail if compilers are unable to deduce a type or compilers deduce the “wrong” type.
+
+In some cases compilers are forbidden from deducing a type.
+
+**0 or NULL as null pointers** are noth well deduced, thus cannot be perfect-forwarded.
+
+**Declaration-only integral static const data members** 
+
+`static const std::size_t MinVals = 28;`
+
+because complier don't create memory for them, they just replace them with their value. If someone takes their address, compilation works but not linking.
+
+For examaple, fwd’s parameter is a
+universal reference, and references, in the code generated by compilers, are usually
+treated like pointers.
+
+For some compilers, linking might work.
+
+The fix is to provide a definitioin.
+
+`const std::size_t Widget::MinVals; // in Widget's .cpp file`
+
+**Overloaded function names and template names**
+
+and **bitfields**
+
+# **Chapter 6:** Lambda Expressions
+
+A lambda expression is just that: an expression. It’s part of the source code.
+
+A closure is the runtime object created by a lambda.
+
+A closure class is a class from which a closure is instantiated. Each lambda causes
+compilers to generate a unique closure class. The statements inside a lambda
+become executable instructions in the member functions of its closure class.
+
+## Item 31: Avoid default capture modes.
+
+Using capture by reference can lead to dangling references if the lambda exists after the local scope where its created.
+
+Make it explicit. `[&divisor]` instead of default `[&]`
+
+Default by value is not the solution since you could copy pointers that could go dangling.
+
+Captures apply only to non-static local variables (including parameters) visible in
+the scope where the lambda is created.
+
+Example, here is `this` that is captured:
+
+```
+void Widget::addFilter() const
+{
+filters.emplace_back(
+[=](int value) { return value % divisor == 0; }
+);
+}
+```
+
+Compilers do something like this:
+```
+void Widget::addFilter() const
+{
+auto currentObjectPtr = this;
+filters.emplace_back(
+[currentObjectPtr](int value)
+{ return value % currentObjectPtr->divisor == 0; }
+);
+}
+```
+
+## Item 32: Use init capture to move objects into closures.
+
+C++14 feature.
+
+```
+auto func = [pw = std::move(pw)]
+                { return pw->isValidated()
+                && pw->isArchived(); };
+```
+
+// C++11 emulation of init capture
+```
+auto func =
+std::bind(
+    [](const std::vector<double>& data)
+    { /* uses of data */ },
+    std::move(data)
+    );
+```
+
+std::bind produces function objects.
+
+The first argument to std::bind is a
+callable object. Subsequent arguments represent values to be passed to that object.
+
+A bind object contains copies of all the arguments passed to std::bind. For each
+lvalue argument, the corresponding object in the bind object is copy constructed. For
+each rvalue, it’s move constructed.
+
+## Item 33: Use decltype on auto&& parameters to std::forward them.
+
+In our lambda, if x is bound to an lvalue, decltype(x) will yield
+an lvalue reference.
+
+if x is bound to an
+rvalue, decltype(x) will yield an rvalue reference instead of the customary non-
+reference.
+
+```
+auto f =
+[](auto&& param)
+{
+return
+func(normalize(std::forward<decltype(param)>(param)));
+};
+```
+
+## Item 34: Prefer lambdas to std::bind.
+
+most important reason: lambdas are more readable
+
+using `std::bind`, the call to the function takes place through a function pointer and compilers are less likely to inline function that are called like that, thus the code might be slower
+
+std::bind always copies its arguments, but callers can achieve the effect of having an argument stored by
+reference by applying std::ref to it. The result of
+auto compressRateB = std::bind(compress, std::ref(w), _1);
+
+is that compressRateB acts as if it holds a reference to w, rather than a copy.
+
+all arguments passed to bind objects are passed by reference, because the func‐
+tion call operator for such objects uses perfect forwarding.
+
+In C++14, there are no reasonable use cases for
+std::bind.
+
+In C++11, however, std::bind can be justified in two constrained situa‐
+tions:
+
+- Move capture.
+
+- Polymorphic function objects.
+
+
+# **Chapter 7:** The Concurrency API
+
+# Item 35: Prefer task-based programming to thread-based.
+
+thread-based approach:
+`std::thread t(doAsyncWork);`
+
+task-based approach:
+`auto fut = std::async(doAsyncWork);`
+
+Why its superior:
+- produces a return value because it provides a `get` function
+- `get` provides access to the exception if it throws
+- frees you from the details of thread management
+
+Software threads are limited. This can throw if no more threads are available.
+`std::thread t(doAsyncWork);`
+
+*Oversubscription* can also happen. That's when you have more software threads ready to run than hardware threads available.
+
+You will avoid this with tasks.
+
+If using `std::async` the scheduler won't create a thread right away.
+
+Situations when using `threads` is appriopriate:
+- Access to the API of the underlying threading implementation (pthreads or Windows’ Threads)
+- Optimize thread usage.
+- Implement advance threading technologies.
+
+# Item 36: Specify std::launch::async if asynchronicity is essential.
+
+- `std::launch::async` launch policy means that f must be run asynchro‐
+nously, i.e., on a different thread
+
+- `std::launch::deferred` launch policy means that f may run only when
+get or wait is called on the future returned by std::async.
+
+    When get or wait is invoked, f will
+    execute synchronously, i.e., the caller will block until f finishes running
+
+The default is `std::launch::async | std::launch::deferred`
+
+This avoids oversubscription for example.
+
+Cautious, if f is defered, it will always return `std::future_status::deferred`.
+
+Example,
+```
+while (fut.wait_for(100ms) !=
+std::future_status::ready)
+{
+…
+}
+```
+
+might never finish, and the bug will be apparent only under heavy loads.
+
+Other issues may arise.
+
+# Item 37: Make std::threads unjoinable on all paths.
+
