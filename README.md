@@ -498,8 +498,8 @@ objects and functions may be used.
 
 ## Item 16: Make const member functions thread safe.
 
-operations on std::atomic variables are often less expensive than mutex
-acquisition and release
+Operations on `std::atomic` variables are often less expensive than mutex
+acquisition and release.
 
 For a single variable or memory location requiring synchroni‐
 zation, use of a std::atomic is adequate, but once you get to two or more variables
@@ -1253,6 +1253,13 @@ Situations when using `threads` is appriopriate:
 - Optimize thread usage.
 - Implement advance threading technologies.
 
+`threads` allow us to set its scheduling priority via its API, `tasks` don't.
+
+`std::thread` objects aren't copyable.
+
+Invoking `join` or `detach` on an unjoinable thread yields undefined
+behavior.
+
 # Item 36: Specify std::launch::async if asynchronicity is essential.
 
 - `std::launch::async` launch policy means that f must be run asynchro‐
@@ -1285,3 +1292,316 @@ Other issues may arise.
 
 # Item 37: Make std::threads unjoinable on all paths.
 
+`.join()` will wait for the content of the `thread` to finish executing.
+
+`detach()` = the connection between the thread and their underlying software thread has been
+severed. The thread will still continue tho.
+
+Destruction of a joinable thread is dangerous, thus it was banned. The standard now says that **destruction of a joinable thread causes program termination**.
+
+Thus, we need to make unjoinable on every path out of the scope in which it’s defined.
+
+Any time you want to perform some action along every path out of a block, the nor‐
+mal approach is to put that action in the destructor of a local object. Such objects are
+known as RAII objects, and the classes they come from are known as **RAII** classes.
+(RAII itself stands for “Resource Acquisition Is Initialization).
+
+RAII is implemented on most STL containers, but not for thread. But, we can implement it ourselves. 
+
+We also saw earlier that doing a join could lead
+to performance anomalies (that, to be frank, could also be unpleasant to debug), but
+given a choice between undefined behavior (which detach would get us), program
+termination (which use of a raw std::thread would yield), or performance anoma‐
+lies, performance anomalies seems like the best of a bad lot.
+
+Using ThreadRAII to perform a join on
+std::thread destruction can sometimes lead not just to a performance anomaly, but
+to a hung program. The “proper” solution to these kinds of problems would be to
+communicate to the asynchronously running lambda that we no longer need its work
+and that it should return early.
+
+# Item 38: Be aware of varying thread handle destructor behavior.
+
+Futures from `std::async` block in their destructors.
+
+Future destructors normally just destroy the future’s data members.
+
+The final future referring to a shared state for a non-deferred task launched
+via std::async blocks until the task completes.
+
+# Item 39: Consider void futures for one-shot event communication.
+
+Case: Sometimes it’s useful for a task to tell a second, asynchronously running task that a
+particular event has occurred.
+
+One possibility is to use a condition variable.
+
+
+```
+void detect 
+{
+    ...
+    cv.notify_one();
+    ...
+}
+
+void react 
+{
+    std::unique_lock<std::mutex> lk(m);
+    cv.wait(lk);
+
+    ...
+}
+```
+
+Note: Locking a mutex before waiting on a condition variable is typical for threading libraries. The
+need to lock the mutex through a std::unique_lock object is simply part of the
+C++11 API.
+
+Code smell here: There is a need for a mute even though, there is not necessarilly a need for shared data.
+
+Even without this, there are still 2 problems:
+- If the detecting task happens to execute the notification before the reacting task executes the wait, the reacting task will miss the notification, and it will wait forever.
+- Spurious wakeups: A fact of life in threading APIs (in many languages—not just C++) is that code waiting on a condition variable may be awakened even if the condvar wasn’t notified. Such awakenings are known as spurious wakeups. Proper code deals with them by confirming that the condition being waited for has truly occurred, and it does
+this as its first action after waking.
+
+Fix for spurious : 
+```
+cv.wait(lk,
+[]{ return whether the event has occurred; });
+```
+
+But it doesn't really work since it condv doesn't know if the event it's waiting for has occurred in the first place.
+
+Next trick: shared flag.
+
+`std::atomic<bool> flag(false);`
+
+The problem here is that the task is blocked but still running in a background thread and thus incurs costs.
+
+That’s an advantage of the condvar-based approach, because a task in a wait call is truly blocked.
+It’s common to combine the condvar and flag-based designs.
+
+This approach works but isn't clean.
+
+```
+std::condition_variable cv;
+std::mutex m;// as before
+bool flag(false);
+{
+    std::lock_guard<std::mutex> g(m);
+    flag = true;
+
+    cv.notify_one();
+}
+
+And here’s the reacting task:
+{
+    …
+    // prepare to react
+    {
+    std::unique_lock<std::mutex> lk(m);
+    cv.wait(lk, [] { return flag; });// use lambda to avoid
+    // spurious wakeups
+    …// react to event
+    // (m is locked)
+    }
+    …
+    // continue reacting
+    // (m now unlocked)
+}
+```
+
+An alternative is to avoid condition variables, mutexes, and flags by having the reacting task wait on a future that’s set by the detecting task.
+
+```
+std::promise<void> p;
+
+...
+detecting task
+p.set_value();
+
+...
+reacting task
+p.get_future().wait();
+```
+
+Like the approach using a flag, this design requires no mutex, works regardless of
+whether the detecting task sets its std::promise before the reacting task waits, and
+is immune to spurious wakeups. (Only condition variables are susceptible to that
+problem.) Like the condvar-based approach, the reacting task is truly blocked after
+making the wait call, so it consumes no system resources while waiting.
+
+Problems:
+- Between a std::promise and a future is a shared state, and shared states are typically dynamically allocated. You should therefore assume that this design incurs the cost of heap-based allocation
+and deallocation.
+- std::promise may be set only once. The communications channel between a std::promise and a future is a one-shot mechanism: it can’t be used repeatedly.
+
+Assuming you want to suspend a thread only once (after creation, but before it’s running its thread function), a design using a void future is a reasonable choice.
+
+```
+std::promise<void> p;
+void react();
+
+void detect()
+{
+    std::thread t([]
+    {
+    p.get_future().wait();
+    react();
+    });
+    // here, t is suspended
+    // prior to call to react
+    … // here function can hang.
+    p.set_value();
+    ...
+
+    t.join();
+}
+```
+
+We could make use of RAII here.
+
+There is still a problem if an exception is thrown at the `...`, the function can hang.
+The thread running the lambda will never finish.
+
+Key: Use std::shared_futures instead of a std::future in the react code. Because std::future’s share member function transfers ownership of its shared state to the std::shared_future object produced by share.
+
+```
+std::promise<void> p;// as before
+void detect()
+{
+    auto sf = p.get_future().share();
+    std::vector<std::thread> vt;
+
+    for (int i = 0; i < threadsToRun; ++i) {
+    vt.emplace_back([sf]{ sf.wait();
+    // wait on local
+    react(); });
+    // copy of sf; see
+    }
+
+    …// detect hangs if
+    // this "…" code throws!
+    p.set_value();// unsuspend all threads
+    …
+    for (auto& t : vt) {
+    t.join();
+    }
+}
+```
+
+# Item 40: Use std::atomic for concurrency, volatile for special memory.
+
+Once a std::atomic object has been constructed, operations on it behave as if they were inside a mutex-protected critical section, but the operations are generally implemented using special machine instructions that are more efficient than would be the case if a mutex were employed.
+
+Don't use `volatile` for concurrent programming. There is no guarantee that there will not be data races.
+
+The Standard’s decree that data races cause undefined behavior means that compilers may generate code to do literally anything.
+
+As a general rule, **compilers are permitted to reorder such unrelated assignments**. That is, given this sequence of assignments (where a, b, x, and y correspond to independent variables),
+a = b;
+x = y;
+compilers may generally reorder them as follows:
+x = y;
+a = b;
+
+Even if compilers don’t reorder them, the underlying hardware might do it.
+
+Solution: Using `std:atomic` imposes a restriction that the code running after will not run before the atomic operation.
+
+Compilers also simplify code:
+
+```
+auto y = x;
+y = x;
+// read x
+// read x again
+x = 10;
+x = 20;
+// write x
+// write x again
+```
+
+Might end like this:
+
+```
+auto y = x;// read x
+x = 20;// write x
+```
+
+Even if we don't write code like this directly,  compilers take reasonable-looking source code and perform template instantiation, inlining, and various common kinds of reordering optimizations, it’s not
+uncommon for the result to have redundant loads and dead stores that compilers can
+get rid of.
+
+Such optimizations are valid only if memory behaves normally. “Special” memory
+doesn’t. Probably the most common kind of special memory is memory used for
+**memory-mapped I/O**.
+
+`volatile` is the way we tell compilers that we’re dealing with special memory. Its
+meaning to compilers is “Don’t perform any optimizations on operations on this
+memory.”
+
+Copy operations for `std::atomic` are deleted. 
+
+```
+auto y = x; // error!
+y = x; // error!
+```
+
+In order for the copy construction of y from x
+to be atomic, compilers would have to generate code to read x and write y in a single
+atomic operation. Hardware generally can’t do that, so copy construction isn’t sup‐
+ported for std::atomic types.
+
+Solution:
+
+```
+std::atomic<int> y(x.load());// read x
+y.store(x.load());// read x again
+```
+
+Given that code, compilers could “optimize” it by storing x’s value in a register
+instead of reading it twice:
+
+```
+register = x.load();// read x into register
+std::atomic<int> y(register);// init y with register value
+y.store(register);// store register value into y
+```
+
+The result, as you can see, reads from x only once, and that’s the kind of optimization
+that must be avoided when dealing with special memory. (The optimization isn’t per‐
+mitted for volatile variables.)
+
+Thus,
+- `std::atomic` is useful for concurrent programming, but not when dealing with special memory.
+- `volatile` is useful when working with special memory (when reads and writes should not be optimized), but not for concurrent programming.
+
+
+# **Chapter 8:** Tweaks
+
+## Item 41: Consider pass by value for copyable parameters that are cheap to move and always copied.
+
+So, as I said, when parameters are copied via assignment, analyzing the cost of pass
+by value is complicated. Usually, the most practical approach is to adopt a “guilty
+until proven innocent” policy, whereby you use overloading or universal references
+instead of pass by value unless it’s been demonstrated that pass by value yields
+acceptably efficient code for the parameter type you need.
+
+Pass by value can also lead to the slicing problem.
+
+## Item 42: Consider emplacement instead of insertion.
+
+Writting `vs.push_back("xyzzy");` is like writting `vs.push_back(std::string("xyzzy"));`.
+
+Insertion functions take objects to be inserted, while
+emplacement functions take constructor arguments for objects to be inserted. This dif‐
+ference permits emplacement functions to avoid the creation and destruction of tem‐
+porary objects that insertion functions can necessitate.
+
+With current implementations of the Standard Library, there are situations where, as expected, emplacement outperforms insertion, but, sadly, there are also situations where the insertion functions run faster.
+
+Depends on a lot of things, thus it needs to be benchmarked.
+
+When you use an emplacement function, be especially careful to make sure you’re passing the correct arguments, because even explicit constructors will be considered by compilers as they try to find a way to interpret your code as valid.
